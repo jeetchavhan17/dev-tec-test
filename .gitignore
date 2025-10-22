@@ -4,3 +4,7 @@ node_modules/
 *.tfstate.*
 .terraform/
 
+*.pem
+*.key
+__pycache__/
+
