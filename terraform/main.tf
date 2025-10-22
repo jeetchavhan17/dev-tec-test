@@ -1,176 +1,122 @@
-# modules/vpc will create a VPC with 2 public and 2 private subnets
 module "vpc" {
   source = "./modules/vpc"
-  cidr = "10.0.0.0/16"
-  azs  = ["${var.aws_region}a", "${var.aws_region}b"]
 }
 
-# create ECR
 resource "aws_ecr_repository" "app" {
-  name = "devops-sample-app-${var.environment}"
-  image_tag_mutability = "MUTABLE"
+  name = "devops-sample-app-dev"
 }
 
-# IAM role for instances to join ECS
-resource "aws_iam_role" "ec2_instance_role" {
-  name = "ecs-instance-role-${var.environment}"
-  assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
+resource "aws_ecs_cluster" "app_cluster" {
+  name = "devops-sample-cluster"
 }
 
-data "aws_iam_policy_document" "ecs_assume_role" {
-  statement {
-    effect = "Allow"
-    principals {
-      type = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-    actions = ["sts:AssumeRole"]
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "ecsTaskExecutionRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_security_group" "ecs_sg" {
+  name        = "ecs_sg"
+  vpc_id      = module.vpc.vpc_id
+  description = "Allow HTTP inbound"
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_instance_policy_attach" {
-  role = aws_iam_role.ec2_instance_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
-}
-
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ecs-instance-profile-${var.environment}"
-  role = aws_iam_role.ec2_instance_role.name
-}
-
-# ECS cluster
-resource "aws_ecs_cluster" "cluster" {
-  name = "devops-cluster-${var.environment}"
-}
-
-# ALB
-resource "aws_lb" "alb" {
-  name               = "devops-alb-${var.environment}"
+resource "aws_lb" "app_lb" {
+  name               = "devops-app-alb"
   internal           = false
   load_balancer_type = "application"
   subnets            = module.vpc.public_subnets
+  security_groups    = [aws_security_group.ecs_sg.id]
 }
 
-resource "aws_lb_target_group" "tg" {
-  name     = "devops-tg-${var.environment}"
-  port     = 3000
+resource "aws_lb_target_group" "app_tg" {
+  name     = "devops-app-tg"
+  port     = var.app_port
   protocol = "HTTP"
   vpc_id   = module.vpc.vpc_id
   health_check {
     path = "/"
-    matcher = "200-399"
   }
 }
 
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.alb.arn
-  port              = "80"
+resource "aws_lb_listener" "app_listener" {
+  load_balancer_arn = aws_lb.app_lb.arn
+  port              = 80
   protocol          = "HTTP"
-
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.tg.arn
+    target_group_arn = aws_lb_target_group.app_tg.arn
   }
 }
 
-# Launch Template for EC2 instances to join ECS cluster
-resource "aws_launch_template" "ecs" {
-  name_prefix = "ecs-launch-${var.environment}-"
-  image_id = data.aws_ami.ecs_ami.id
-  instance_type = "t3.micro"
-  iam_instance_profile {
-    name = aws_iam_instance_profile.ec2_profile.name
-  }
-  user_data = base64encode(<<-EOT
-              #!/bin/bash
-              echo ECS_CLUSTER=${aws_ecs_cluster.cluster.name} >> /etc/ecs/ecs.config
-  EOT)
-  network_interfaces {
-    associate_public_ip_address = true
-    security_groups = [module.vpc.default_sg_id]
-  }
-}
-
-data "aws_ami" "ecs_ami" {
-  most_recent = true
-  owners = ["amazon"]
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]
-  }
-}
-
-resource "aws_autoscaling_group" "ecs" {
-  name                      = "ecs-asg-${var.environment}"
-  min_size                  = 1
-  max_size                  = 2
-  desired_capacity          = 1
-  vpc_zone_identifier       = module.vpc.public_subnets
-  launch_template {
-    id      = aws_launch_template.ecs.id
-    version = "$Latest"
-  }
-  tag {
-    key                 = "Name"
-    value               = "ecs-instance-${var.environment}"
-    propagate_at_launch = true
-  }
-}
-
-# ECS Task Definition (task will pull the image from ECR)
-resource "aws_ecs_task_definition" "task" {
-  family                   = "devops-task-${var.environment}"
-  network_mode             = "bridge"
-  requires_compatibilities = ["EC2"]
-  cpu                      = "256"
-  memory                   = "512"
-
-  container_definitions = jsonencode([
+resource "aws_ecs_task_definition" "app_task" {
+  family                   = "devops-sample-app"
+  network_mode              = "bridge"
+  requires_compatibilities  = ["EC2"]
+  cpu                       = "256"
+  memory                    = "512"
+  execution_role_arn        = aws_iam_role.ecs_task_execution_role.arn
+  container_definitions     = jsonencode([
     {
-      name  = "app"
-      image = var.app_image
+      name      = "app"
+      image     = var.app_image
       essential = true
-      portMappings = [
-        { containerPort = 3000, hostPort = 3000, protocol = "tcp" }
-      ]
+      portMappings = [{
+        containerPort = var.app_port
+        hostPort      = var.app_port
+      }]
       environment = [
+        { name = "PORT", value = tostring(var.app_port) },
         { name = "MONGODB_URI", value = var.mongodb_uri }
       ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {
-          "awslogs-group" = "/ecs/devops-app"
-          "awslogs-region" = var.aws_region
-          "awslogs-stream-prefix" = "app"
+          awslogs-group         = "/ecs/devops-app"
+          awslogs-region        = "us-east-1"
+          awslogs-stream-prefix = "ecs"
         }
       }
     }
   ])
 }
 
-# CloudWatch log group
-resource "aws_cloudwatch_log_group" "ecs" {
-  name = "/ecs/devops-app"
-  retention_in_days = 14
-}
-
-# ECS Service
-resource "aws_ecs_service" "service" {
-  name            = "devops-service-${var.environment}"
-  cluster         = aws_ecs_cluster.cluster.id
-  task_definition = aws_ecs_task_definition.task.arn
+resource "aws_ecs_service" "app_service" {
+  name            = "devops-app-service"
+  cluster         = aws_ecs_cluster.app_cluster.id
+  task_definition = aws_ecs_task_definition.app_task.arn
   desired_count   = 1
   launch_type     = "EC2"
-
   load_balancer {
-    target_group_arn = aws_lb_target_group.tg.arn
+    target_group_arn = aws_lb_target_group.app_tg.arn
     container_name   = "app"
-    container_port   = 3000
+    container_port   = var.app_port
   }
-
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.app_listener]
 }
-
-# Register ASG instances to the target group via instance target (ECS will manage service registration)
-# No extra code needed: ECS agent on instances will register tasks to the TG via service.
-
